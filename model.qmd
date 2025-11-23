@@ -1,0 +1,522 @@
+---
+title: "NFL Big Data Bowl 2026"
+author: "Zach Culp"
+format: html
+editor: visual
+---
+
+```{r}
+# Step 1: Install Python via reticulate
+library(reticulate)
+install_python(version = "3.10:latest")
+
+# Step 2: After Python installs, install TensorFlow
+library(tensorflow)
+install_tensorflow(version = "default")
+
+# Step 3: Install Keras
+library(keras)
+install_keras()
+
+# Step 4: Verify installation
+library(tensorflow)
+tf$constant("Hello TensorFlow")
+
+library(tidyverse)
+```
+
+## Method
+
+$||\Delta \vec{p}|| = \sqrt{p_i^2 + p_f^2 - 2p_ip_f* cos \theta}$,
+
+where the initial momentum is $p_i = mv$, and the final momentum is $p_f = mv_f$
+
+We want $\%\text{loss} = \frac{||\Delta\vec{p}||}{p_i}$
+
+```{r}
+# Momentum loss function
+momentum_loss <- function(mass, speed_initial, speed_final = NULL, angle_deg) {
+  theta <- angle_deg * pi / 180
+  p_i <- mass * speed_initial
+  
+  if (is.null(speed_final)) {
+    speed_final <- speed_initial
+  }
+  
+  p_f <- mass * speed_final
+  delta_p <- sqrt(p_i^2 + p_f^2 - 2 * p_i * p_f * cos(theta))
+  percent_loss <- delta_p / p_i * 100
+  
+  list(delta_p = delta_p, percent_loss = percent_loss)
+}
+
+# Example usage
+# 80 kg runner, 6 m/s, turning 45 degrees, maintaining speed
+momentum_loss(mass = 80, speed_initial = 6, angle_deg = 45)
+
+# 80 kg runner, 6 m/s → 5 m/s, turning 90 degrees
+momentum_loss(mass = 80, speed_initial = 6, speed_final = 5, angle_deg = 90)
+
+```
+
+## Predictive Model
+
+```{r}
+library(keras)
+library(tensorflow)
+library(dplyr)
+library(tidyr)
+library(readr)
+
+# Momentum loss function (provided)
+momentum_loss <- function(mass, speed_initial, speed_final = NULL, angle_deg) {
+  theta <- angle_deg * pi / 180
+  p_i <- mass * speed_initial
+  
+  if (is.null(speed_final)) {
+    speed_final <- speed_initial
+  }
+  
+  p_f <- mass * speed_final
+  delta_p <- sqrt(p_i^2 + p_f^2 - 2 * p_i * p_f * cos(theta))
+  percent_loss <- delta_p / p_i * 100
+  
+  list(delta_p = delta_p, percent_loss = percent_loss)
+}
+
+# Calculate angle between current direction and target
+calculate_angle_to_target <- function(x_current, y_current, dir_current, 
+                                      x_target, y_target) {
+  dx <- x_target - x_current
+  dy <- y_target - y_current
+  angle_to_target <- atan2(dy, dx) * 180 / pi
+  
+  # Normalize angles to [0, 360)
+  angle_to_target <- (angle_to_target + 360) %% 360
+  dir_current <- (dir_current + 360) %% 360
+  
+  # Calculate smallest angle difference
+  angle_diff <- abs(angle_to_target - dir_current)
+  if (angle_diff > 180) {
+    angle_diff <- 360 - angle_diff
+  }
+  
+  return(angle_diff)
+}
+
+# Prepare sequences for LSTM with input and output data
+prepare_lstm_data <- function(tracking_input, tracking_output, sequence_length = 10) {
+  
+  cat("Preparing LSTM sequences from input/output data...\n")
+  
+  # Get unique plays to predict
+  plays_to_predict <- tracking_input %>%
+    filter(player_to_predict == TRUE) %>%
+    distinct(game_id, play_id, nfl_id, ball_land_x, ball_land_y, 
+             num_frames_output, player_weight) %>%
+    arrange(game_id, play_id, nfl_id)
+  
+  cat(sprintf("Found %d players to predict\n", nrow(plays_to_predict)))
+  
+  sequences_list <- list()
+  targets_list <- list()
+  metadata_list <- list()
+  
+  for (i in 1:nrow(plays_to_predict)) {
+    play_info <- plays_to_predict[i, ]
+    
+    # Get input tracking data (before pass thrown)
+    input_data <- tracking_input %>%
+      filter(game_id == play_info$game_id,
+             play_id == play_info$play_id,
+             nfl_id == play_info$nfl_id) %>%
+      arrange(frame_id)
+    
+    # Get output tracking data (after pass thrown) - this is our target
+    output_data <- tracking_output %>%
+      filter(game_id == play_info$game_id,
+             play_id == play_info$play_id,
+             nfl_id == play_info$nfl_id) %>%
+      arrange(frame_id)
+    
+    # Need enough input frames and output frames
+    if (nrow(input_data) < sequence_length || nrow(output_data) == 0) {
+      next
+    }
+    
+    # Use last sequence_length frames from input as features
+    input_frames <- input_data %>%
+      tail(sequence_length)
+    
+    # Get last frame info for calculations
+    last_frame <- tail(input_frames, 1)
+    
+    # Calculate features for input sequence
+    features <- input_frames %>%
+      mutate(
+        dist_to_target = sqrt((play_info$ball_land_x - x)^2 + 
+                             (play_info$ball_land_y - y)^2),
+        angle_to_target = mapply(calculate_angle_to_target, 
+                                 x, y, dir,
+                                 MoreArgs = list(x_target = play_info$ball_land_x,
+                                               y_target = play_info$ball_land_y)),
+        # Normalize angles to [0, 1]
+        o_norm = o / 360,
+        dir_norm = dir / 360
+      ) %>%
+      select(x, y, s, a, o_norm, dir_norm, dist_to_target, angle_to_target) %>%
+      as.matrix()
+    
+    sequences_list[[length(sequences_list) + 1]] <- features
+    
+    # Target: all output trajectory points (x, y for each frame)
+    target_trajectory <- output_data %>%
+      select(frame_id, x, y) %>%
+      arrange(frame_id)
+    
+    targets_list[[length(targets_list) + 1]] <- target_trajectory
+    
+    # Calculate momentum loss for actual trajectory
+    # Note: output data doesn't have speed, so we calculate based on position change
+    first_output_frame <- head(output_data, 1)
+    angle_diff <- calculate_angle_to_target(
+      last_frame$x, last_frame$y, last_frame$dir,
+      first_output_frame$x, first_output_frame$y
+    )
+    
+    momentum_info <- momentum_loss(
+      mass = play_info$player_weight,
+      speed_initial = last_frame$s,
+      speed_final = NULL,  # Assume speed maintained since output has no speed data
+      angle_deg = angle_diff
+    )
+    
+    metadata_list[[length(metadata_list) + 1]] <- data.frame(
+      game_id = play_info$game_id,
+      play_id = play_info$play_id,
+      nfl_id = play_info$nfl_id,
+      player_weight = play_info$player_weight,
+      num_frames = play_info$num_frames_output,
+      current_s = last_frame$s,
+      current_dir = last_frame$dir,
+      current_x = last_frame$x,
+      current_y = last_frame$y,
+      ball_land_x = play_info$ball_land_x,
+      ball_land_y = play_info$ball_land_y,
+      actual_momentum_loss_pct = momentum_info$percent_loss,
+      actual_num_output_frames = nrow(output_data)
+    )
+  }
+  
+  cat(sprintf("Created %d training sequences\n", length(sequences_list)))
+  
+  # Convert to arrays
+  X <- array(0, dim = c(length(sequences_list), sequence_length, 8))
+  for (i in seq_along(sequences_list)) {
+    X[i, , ] <- sequences_list[[i]]
+  }
+  
+  # For targets, we'll predict the full trajectory
+  # Find max number of output frames
+  max_output_frames <- max(sapply(targets_list, nrow))
+  
+  # Create padded target array (samples, max_frames, 2) where 2 = (x, y)
+  y <- array(0, dim = c(length(targets_list), max_output_frames, 2))
+  
+  for (i in seq_along(targets_list)) {
+    n_frames <- nrow(targets_list[[i]])
+    y[i, 1:n_frames, 1] <- targets_list[[i]]$x
+    y[i, 1:n_frames, 2] <- targets_list[[i]]$y
+    
+    # Pad remaining frames with last position (player stays at ball)
+    if (n_frames < max_output_frames) {
+      y[i, (n_frames+1):max_output_frames, 1] <- tail(targets_list[[i]]$x, 1)
+      y[i, (n_frames+1):max_output_frames, 2] <- tail(targets_list[[i]]$y, 1)
+    }
+  }
+  
+  metadata <- bind_rows(metadata_list)
+  
+  list(X = X, y = y, metadata = metadata, max_output_frames = max_output_frames)
+}
+
+# Build LSTM model for sequence-to-sequence prediction
+build_lstm_model <- function(input_sequence_length = 10, 
+                             output_sequence_length = 20,
+                             n_features = 8, 
+                             lstm_units = 128, 
+                             dropout_rate = 0.3) {
+  
+  # Force integers
+  input_sequence_length <- as.integer(input_sequence_length)
+  output_sequence_length <- as.integer(output_sequence_length)
+  lstm_units <- as.integer(lstm_units)
+  lstm_units_half <- as.integer(lstm_units / 2)
+  
+  encoder_inputs <- layer_input(shape = c(input_sequence_length, n_features))
+  
+  encoder <- encoder_inputs %>%
+    layer_lstm(units = lstm_units, 
+               return_sequences = TRUE,
+               dropout = dropout_rate,
+               recurrent_dropout = dropout_rate) %>%
+    layer_lstm(units = lstm_units, 
+               return_sequences = FALSE,
+               dropout = dropout_rate,
+               recurrent_dropout = dropout_rate)
+  
+  # Repeat encoder output for decoder
+  decoder_input <- encoder %>%
+    layer_repeat_vector(n = output_sequence_length)
+  
+  # Decoder
+  decoder <- decoder_input %>%
+    layer_lstm(units = lstm_units, 
+               return_sequences = TRUE,
+               dropout = dropout_rate) %>%
+    layer_lstm(units = lstm_units_half, 
+               return_sequences = TRUE,
+               dropout = dropout_rate) %>%
+    layer_dense(units = 32L, activation = 'relu') %>%
+    layer_dense(units = 2L)  # Output: (x, y) per timestep
+  
+  model <- keras_model(inputs = encoder_inputs, outputs = decoder)
+  
+  # Compile using the new Keras 3 API
+  model$compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = 'mse',
+    metrics = list('mae')
+  )
+  
+  return(model)
+}
+
+# Custom momentum-aware loss (for future enhancement)
+create_momentum_loss <- function(metadata) {
+  function(y_true, y_pred) {
+    # Base MSE loss
+    mse <- k_mean(k_square(y_true - y_pred))
+    
+    # Could add momentum penalty here
+    # For now, just use MSE
+    mse
+  }
+}
+
+# Training function
+train_model <- function(tracking_input, tracking_output, 
+                       input_sequence_length = 10, 
+                       epochs = 100, 
+                       batch_size = 32, 
+                       validation_split = 0.2) {
+  
+  # Prepare data
+  cat("Preparing training data...\n")
+  data_prep <- prepare_lstm_data(tracking_input, tracking_output, input_sequence_length)
+  
+  X_train <- data_prep$X
+  y_train <- data_prep$y
+  metadata <- data_prep$metadata
+  output_sequence_length <- data_prep$max_output_frames
+  
+  cat(sprintf("Input shape: %s\n", paste(dim(X_train), collapse = " x ")))
+  cat(sprintf("Output shape: %s\n", paste(dim(y_train), collapse = " x ")))
+  
+  # Feature normalization (input features)
+  x_means <- apply(X_train, 3, mean)
+  x_sds <- apply(X_train, 3, sd)
+  
+  for (i in 1:dim(X_train)[3]) {
+    X_train[, , i] <- (X_train[, , i] - x_means[i]) / (x_sds[i] + 1e-7)
+  }
+  
+  # Target normalization (x, y coordinates)
+  # Normalize across all frames and coordinates
+  y_flat <- array(y_train, dim = c(dim(y_train)[1] * dim(y_train)[2], 2))
+  y_means <- colMeans(y_flat)
+  y_sds <- apply(y_flat, 2, sd)
+  
+  y_train_norm <- y_train
+  for (i in 1:2) {
+    y_train_norm[, , i] <- (y_train[, , i] - y_means[i]) / (y_sds[i] + 1e-7)
+  }
+  
+  # Build model
+  cat("Building model...\n")
+  model <- build_lstm_model(
+    input_sequence_length = input_sequence_length,
+    output_sequence_length = output_sequence_length
+  )
+  
+  cat(sprintf("Model built with %d trainable parameters\n", 
+              count_params(model)))
+  
+  # Train model
+  cat("Training model...\n")
+  history <- model$fit(
+    X_train, y_train_norm,
+    epochs = epochs,
+    batch_size = batch_size,
+    validation_split = validation_split,
+    callbacks = list(
+      callback_early_stopping(monitor = 'val_loss', patience = 15, 
+                            restore_best_weights = TRUE),
+      callback_reduce_lr_on_plateau(monitor = 'val_loss', patience = 7, 
+                                   factor = 0.5, min_lr = 1e-6)
+    ),
+    verbose = 1
+  )
+  
+  list(
+    model = model,
+    history = history,
+    normalization = list(
+      x_means = x_means,
+      x_sds = x_sds,
+      y_means = y_means,
+      y_sds = y_sds
+    ),
+    metadata = metadata,
+    input_sequence_length = input_sequence_length,
+    output_sequence_length = output_sequence_length
+  )
+}
+
+# Prediction function for test data
+predict_trajectories <- function(model_obj, test_tracking_input) {
+  
+  sequence_length <- model_obj$input_sequence_length
+  output_length <- model_obj$output_sequence_length
+  
+  # Get plays to predict
+  plays_to_predict <- test_tracking_input %>%
+    filter(player_to_predict == TRUE) %>%
+    distinct(game_id, play_id, nfl_id, ball_land_x, ball_land_y, 
+             num_frames_output, player_weight) %>%
+    arrange(game_id, play_id, nfl_id)
+  
+  cat(sprintf("Predicting %d player trajectories...\n", nrow(plays_to_predict)))
+  
+  all_predictions <- list()
+  
+  for (i in 1:nrow(plays_to_predict)) {
+    play_info <- plays_to_predict[i, ]
+    
+    # Get input data
+    input_data <- test_tracking_input %>%
+      filter(game_id == play_info$game_id,
+             play_id == play_info$play_id,
+             nfl_id == play_info$nfl_id) %>%
+      arrange(frame_id)
+    
+    if (nrow(input_data) < sequence_length) {
+      warning(sprintf("Not enough frames for game %d, play %d, player %d",
+                     play_info$game_id, play_info$play_id, play_info$nfl_id))
+      next
+    }
+    
+    # Prepare features
+    input_frames <- input_data %>%
+      tail(sequence_length)
+    
+    features <- input_frames %>%
+      mutate(
+        dist_to_target = sqrt((play_info$ball_land_x - x)^2 + 
+                             (play_info$ball_land_y - y)^2),
+        angle_to_target = mapply(calculate_angle_to_target, 
+                                 x, y, dir,
+                                 MoreArgs = list(x_target = play_info$ball_land_x,
+                                               y_target = play_info$ball_land_y)),
+        o_norm = o / 360,
+        dir_norm = dir / 360
+      ) %>%
+      select(x, y, s, a, o_norm, dir_norm, dist_to_target, angle_to_target) %>%
+      as.matrix()
+    
+    # Normalize
+    X_test <- array(features, dim = c(1, sequence_length, 8))
+    for (j in 1:8) {
+      X_test[1, , j] <- (X_test[1, , j] - model_obj$normalization$x_means[j]) / 
+        (model_obj$normalization$x_sds[j] + 1e-7)
+    }
+    
+    # Predict
+    pred_norm <- model_obj$model$predict(X_test, verbose = 0)
+    
+    # Denormalize
+    pred <- pred_norm
+    pred[1, , 1] <- pred_norm[1, , 1] * model_obj$normalization$y_sds[1] + 
+      model_obj$normalization$y_means[1]
+    pred[1, , 2] <- pred_norm[1, , 2] * model_obj$normalization$y_sds[2] + 
+      model_obj$normalization$y_means[2]
+    
+    # Create output dataframe
+    last_frame <- tail(input_frames, 1)
+    
+    pred_df <- data.frame(
+      game_id = play_info$game_id,
+      play_id = play_info$play_id,
+      nfl_id = play_info$nfl_id,
+      frame_id = 1:play_info$num_frames_output,
+      x = pred[1, 1:play_info$num_frames_output, 1],
+      y = pred[1, 1:play_info$num_frames_output, 2]
+    )
+    
+    # Calculate momentum loss
+    first_pred <- head(pred_df, 1)
+    angle_diff <- calculate_angle_to_target(
+      last_frame$x, last_frame$y, last_frame$dir,
+      first_pred$x, first_pred$y
+    )
+    
+    momentum_info <- momentum_loss(
+      mass = play_info$player_weight,
+      speed_initial = last_frame$s,
+      speed_final = NULL,
+      angle_deg = angle_diff
+    )
+    
+    pred_df$momentum_loss_pct <- momentum_info$percent_loss
+    
+    all_predictions[[length(all_predictions) + 1]] <- pred_df
+  }
+  
+  bind_rows(all_predictions)
+}
+
+# Example usage:
+# Load data
+ tracking_input <- read_csv("train/input_2023_w01.csv")
+ tracking_output <- read_csv("train/output_2023_w01.csv")
+
+# Train model
+ trained_model <- train_model(
+   tracking_input, 
+   tracking_output,
+   input_sequence_length = 10,
+   epochs = 100,
+   batch_size = 32
+ )
+
+# Make predictions on test data
+# test_input <- read_csv("test/input_2023_w02.csv")
+# predictions <- predict_trajectories(trained_model, test_input)
+
+# Save predictions
+# write_csv(predictions, "predictions.csv")
+```
+
+```{r}
+debug_type <- function(var_name, var_value) {
+  cat(sprintf("%s: class=%s, type=%s, length=%d, value=%s\n",
+              var_name,
+              paste(class(var_value), collapse=","),
+              typeof(var_value),
+              length(var_value),
+              toString(var_value)))
+}
+
+```
+
+## Predictions
