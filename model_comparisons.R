@@ -910,8 +910,8 @@ cross_validate_models <- function(input_data, output_data, n_folds = 5) {
 # ============================================================================
 
 # # Load data
-input_files <- list.files("train", pattern = "input_2023_w[0-9]{2}\\.csv", full.names = TRUE)
-output_files <- list.files("train", pattern = "output_2023_w[0-9]{2}\\.csv", full.names = TRUE)
+input_files <- list.files("train", pattern = "C:/Users/ASUS/OneDrive/Desktop/Big Data Bowl 2026/train/input_2023_w[0-9]{2}\\.csv", full.names = TRUE)
+output_files <- list.files("train", pattern = "C:/Users/ASUS/OneDrive/Desktop/Big Data Bowl 2026/train/output_2023_w[0-9]{2}\\.csv", full.names = TRUE)
 # 
 input_data <- map_dfr(input_files, fread)
 output_data <- map_dfr(output_files, fread)
